@@ -1,6 +1,7 @@
 node_modules/
 tokens.json
 apikeys.json
+stats.json
 .wrangler/
 .dev.vars
 *.log

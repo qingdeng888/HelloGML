@@ -19,6 +19,19 @@ export function setSignSecret(secret: string) {
   signSecret = secret;
 }
 
+// ==================== 自动删除会话开关 ====================
+
+let autoDelete = true;
+
+export function setAutoDelete(v: boolean) {
+  autoDelete = v;
+  console.error(`[Config] auto_delete = ${v}`);
+}
+
+export function getAutoDelete(): boolean {
+  return autoDelete;
+}
+
 const USER_AGENTS = [
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -59,33 +72,54 @@ function getHeaders() {
 
 // ==================== Tool Calling Helpers ====================
 
+function buildDynamicExamples(tools: any[]): string {
+  if (tools.length === 0) return "";
+  const sorted = [...tools].sort((a, b) => {
+    const na = (a.function || a).name || "";
+    const nb = (b.function || b).name || "";
+    return na.length - nb.length;
+  });
+  const picked = sorted.slice(0, Math.min(2, sorted.length));
+  const examples: string[] = [];
+  for (const tool of picked) {
+    const fn = tool.function || tool;
+    const name = fn.name;
+    const params = fn.parameters || fn.input_schema || {};
+    const props = params.properties || {};
+    const required = params.required || [];
+    const sampleArgs: Record<string, any> = {};
+    for (const key of required.slice(0, 2)) {
+      const prop = props[key];
+      if (!prop) continue;
+      if (prop.type === "string") sampleArgs[key] = prop.description || "example_value";
+      else if (prop.type === "number" || prop.type === "integer") sampleArgs[key] = 1;
+      else if (prop.type === "boolean") sampleArgs[key] = true;
+      else sampleArgs[key] = "example_value";
+    }
+    if (Object.keys(sampleArgs).length === 0) {
+      const firstKey = Object.keys(props)[0];
+      if (firstKey) sampleArgs[firstKey] = "example_value";
+    }
+    if (Object.keys(sampleArgs).length > 0) {
+      examples.push("User: [task requiring " + name + "]\nAssistant: ##TOOL_CALL##\n" + JSON.stringify({name, arguments: sampleArgs}) + "\n##END_CALL##");
+    }
+  }
+  examples.push("User: Hello!\nAssistant: Hello! How can I help you today?");
+  return examples.join("\n\n");
+}
+
 function injectToolsPrompt(messages: any[], tools: any[]): any[] {
   if (!tools || tools.length === 0) return messages;
   const toolsDesc = tools.map((tool: any) => {
     const fn = tool.function || tool;
-    return `### ${fn.name}
-Description: ${fn.description || ""}
-Parameters: ${JSON.stringify(fn.parameters || {}, null, 2)}`;
+    return "### " + fn.name + "\nDescription: " + (fn.description || "No description") + "\nParameters: " + JSON.stringify(fn.parameters || fn.input_schema || {}, null, 2);
   }).join("\n\n");
-  const prompt = `You are an assistant with access to tools. When you need to use a tool, you MUST output ONLY a single JSON object with NO markdown, NO explanations, and NO extra text.
-
-STRICT RULES:
-1. If a tool is needed, output EXACTLY this format (nothing else):
-{"tool_calls":[{"name":"TOOL_NAME","arguments":{"param":"value"}}]}
-
-2. Do NOT wrap the JSON in markdown code blocks (no \`\`\`json).
-3. Do NOT add any explanation before or after the JSON.
-4. If no tool is needed, respond normally with plain text.
-
-Available tools:
-${toolsDesc}
-
-Examples:
-User: What is the weather in Beijing?
-Assistant: {"tool_calls":[{"name":"get_weather","arguments":{"location":"Beijing"}}]}
-
-User: Hello
-Assistant: Hello! How can I help you today?`;
+  const examples = buildDynamicExamples(tools);
+  const prompt = "You have access to the following tools. To call a tool, use EXACTLY one of these two formats. No explanations before or after the tool call.\n\n" +
+    "FORMAT A (preferred):\n##TOOL_CALL##\n{\"name\":\"tool_name\",\"arguments\":{\"key\":\"value\"}}\n##END_CALL##\n\n" +
+    "FORMAT B (OpenAI-compatible):\n{\"tool_calls\":[{\"name\":\"tool_name\",\"arguments\":{\"key\":\"value\"}}]}\n\n" +
+    "RULES:\n1. Output ONLY the tool call JSON. No markdown fences, no extra text.\n2. For multiple tools, use multiple ##TOOL_CALL## blocks or one {\"tool_calls\":[...]} array.\n3. If no tool is needed, respond normally with plain text.\n\n" +
+    "Available tools:\n" + toolsDesc + "\n\n" + examples;
   const newMessages = [...messages];
   const systemIdx = newMessages.findIndex((m: any) => m.role === "system");
   if (systemIdx >= 0) {
@@ -97,92 +131,264 @@ Assistant: Hello! How can I help you today?`;
   return newMessages;
 }
 
-function parseToolCalls(content: string): { tool_calls: any[] | null; text: string } {
-  if (!content || !content.trim()) return { tool_calls: null, text: content };
-  let working = content.trim();
+// --- Tool call parsing: multi-format waterfall ---
 
-  // 1. 去除 markdown 代码块（```json ... ``` 或 ``` ... ```）
-  const codeBlockMatch = working.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  if (codeBlockMatch) {
-    working = codeBlockMatch[1].trim();
+// 工具名大小写模糊匹配：根据 tools 列表修正工具名
+function normalizeToolName(name: string, tools: any[]): string {
+  if (!name || !tools || tools.length === 0) return name;
+  const lower = name.toLowerCase();
+  // 精确匹配
+  for (const tool of tools) {
+    const fn = tool.function || tool;
+    if (fn.name === name) return name;
   }
-
-  // 2. 尝试精确提取 {"tool_calls": [...]} 结构（支持嵌套对象）
-  const braceMatch = extractJsonObject(working, "tool_calls");
-  if (braceMatch) {
-    try {
-      const parsed = JSON.parse(braceMatch);
-      if (parsed.tool_calls && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
-        const toolCalls = parsed.tool_calls.map((tc: any, idx: number) => ({
-          id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
-          type: "function",
-          function: {
-            name: tc.name || tc.function?.name || "",
-            arguments: typeof tc.arguments === "string"
-              ? tc.arguments
-              : typeof tc.function?.arguments === "string"
-                ? tc.function.arguments
-                : JSON.stringify(tc.arguments || tc.function?.arguments || {}),
-          },
-        }));
-        // 移除原始内容中的 JSON 部分（包括代码块）
-        let text = content.replace(braceMatch, "").trim();
-        if (codeBlockMatch) text = content.replace(codeBlockMatch[0], "").trim();
-        return { tool_calls: toolCalls, text };
-      }
-    } catch (_) {
-      // 继续尝试修复解析
-    }
+  // 大小写不敏感匹配
+  for (const tool of tools) {
+    const fn = tool.function || tool;
+    if (fn.name?.toLowerCase() === lower) return fn.name;
   }
-
-  // 3. 回退：尝试修复常见 JSON 格式错误后再解析
-  try {
-    const fixed = working
-      .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2":')
-      .replace(/:\s*'([^']*)'/g, ':"$1"');
-    const parsed = JSON.parse(fixed);
-    if (parsed.tool_calls && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
-      const toolCalls = parsed.tool_calls.map((tc: any, idx: number) => ({
-        id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
-        type: "function",
-        function: {
-          name: tc.name || tc.function?.name || "",
-          arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments || {}),
-        },
-      }));
-      let text = content.replace(working, "").trim();
-      if (codeBlockMatch) text = content.replace(codeBlockMatch[0], "").trim();
-      return { tool_calls: toolCalls, text };
-    }
-  } catch (_) {
-    // ignore
+  // 去掉下划线/横杠后匹配（如 bash_tool -> Bash）
+  const stripped = lower.replace(/[-_]/g, "");
+  for (const tool of tools) {
+    const fn = tool.function || tool;
+    if (fn.name?.toLowerCase().replace(/[-_]/g, "") === stripped) return fn.name;
   }
-
-  return { tool_calls: null, text: content };
+  return name; // 未找到匹配，返回原名
 }
 
-// 辅助函数：从字符串中提取以指定 key 开头的完整 JSON 对象（支持嵌套）
-function extractJsonObject(str: string, key: string): string | null {
+// 常见参数名别名映射
+const PARAM_ALIASES: Record<string, string[]> = {
+  command: ["cmd", "script", "shell"],
+  file_path: ["path", "filepath", "filename", "file", "target_file"],
+  content: ["text", "body", "data", "file_content", "contents", "value", "file_content"],
+  query: ["question", "search", "prompt"],
+  url: ["uri", "link"],
+};
+
+// 工具参数修复：根据 schema 修复参数名和类型
+function coerceToolArguments(call: any, tools?: any[]): any {
+  const fn = call.function;
+  if (!fn) return call;
+  let args: any;
+  try {
+    args = typeof fn.arguments === "string" ? JSON.parse(fn.arguments) : fn.arguments;
+  } catch { return call; }
+  if (!args || typeof args !== "object") return call;
+
+  // 1. 找到对应 tool 的 schema
+  const toolDef = tools?.find((t: any) => {
+    const f = t.function || t;
+    return f.name === fn.name;
+  });
+  const schema = toolDef?.function?.parameters || toolDef?.parameters || toolDef?.function?.input_schema || {};
+  const props = schema.properties || {};
+  const required = schema.required || [];
+
+  // 2. 大小写不敏感的参数名修复（按 schema properties 匹配）
+  const fixed: Record<string, any> = {};
+  const propKeys = Object.keys(props);
+  for (const [key, value] of Object.entries(args)) {
+    let matchedKey = key;
+    // 精确匹配
+    if (!props[key]) {
+      // 大小写不敏感匹配
+      const lower = key.toLowerCase();
+      const found = propKeys.find((pk) => pk.toLowerCase() === lower);
+      if (found) matchedKey = found;
+      else {
+        // 别名匹配
+        for (const [canonical, aliases] of Object.entries(PARAM_ALIASES)) {
+          if (aliases.includes(lower) && props[canonical]) {
+            matchedKey = canonical;
+            break;
+          }
+        }
+      }
+    }
+    fixed[matchedKey] = value;
+  }
+
+  // 3. 类型修复：根据 schema 将字符串转换为正确类型
+  for (const [key, value] of Object.entries(fixed)) {
+    const propSchema = props[key];
+    if (!propSchema) continue;
+    const type = propSchema.type;
+    // 字符串 "true"/"false" -> boolean
+    if (type === "boolean" && typeof value === "string") {
+      if (value.toLowerCase() === "true") fixed[key] = true;
+      else if (value.toLowerCase() === "false") fixed[key] = false;
+    }
+    // 字符串数字 -> number
+    if (type === "number" || type === "integer") {
+      if (typeof value === "string" && !isNaN(Number(value))) {
+        fixed[key] = Number(value);
+      }
+    }
+    // 字符串 JSON -> object/array
+    if ((type === "object" || type === "array") && typeof value === "string") {
+      try {
+        const parsed = JSON.parse(value);
+        if (typeof parsed === "object") fixed[key] = parsed;
+      } catch { /* keep as string */ }
+    }
+  }
+
+  return {
+    ...call,
+    function: { ...fn, arguments: JSON.stringify(fixed) },
+  };
+}
+
+function makeToolCall(name: string, args: any, idx = 0): any {
+  const argsStr = typeof args === "string" ? args : JSON.stringify(args || {});
+  return {
+    id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
+    type: "function",
+    function: { name, arguments: argsStr },
+  };
+}
+
+function stripCodeBlocks(text: string): string {
+  const match = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  return match ? match[1].trim() : text;
+}
+
+function extractMarkerToolCalls(text: string): { calls: any[]; cleaned: string } {
+  const calls: any[] = [];
+  const re = /##TOOL_CALL##\s*([\s\S]*?)\s*##END_CALL##/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (parsed.name) {
+        calls.push(makeToolCall(parsed.name, parsed.arguments || parsed.input || {}, calls.length));
+      } else if (parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
+        for (const tc of parsed.tool_calls) {
+          const name = tc.name || tc.function?.name || "";
+          const args = tc.arguments || tc.function?.arguments || tc.input || {};
+          if (name) calls.push(makeToolCall(name, args, calls.length));
+        }
+      }
+    } catch { /* skip malformed */ }
+  }
+  const cleaned = text.replace(re, "").trim();
+  return { calls, cleaned };
+}
+
+function extractJSONObject(str: string, key: string): string | null {
   const idx = str.indexOf(`"${key}"`);
   if (idx === -1) return null;
-  // 向前找到 {
   let start = idx;
   while (start > 0 && str[start] !== "{") start--;
   if (str[start] !== "{") return null;
-  // 向后匹配括号
-  let depth = 0;
-  let inString = false;
-  let escape = false;
+  let depth = 0, inStr = false, esc = false;
   for (let i = start; i < str.length; i++) {
     const ch = str[i];
-    if (escape) { escape = false; continue; }
-    if (ch === "\\") { escape = true; continue; }
-    if (ch === '"' && !escape) { inString = !inString; continue; }
-    if (inString) continue;
+    if (esc) { esc = false; continue; }
+    if (ch === "\\") { esc = true; continue; }
+    if (ch === '"' && !esc) { inStr = !inStr; continue; }
+    if (inStr) continue;
     if (ch === "{") depth++;
     else if (ch === "}") { depth--; if (depth === 0) return str.slice(start, i + 1); }
   }
   return null;
+}
+
+function extractJSONToolCalls(text: string): any[] {
+  const calls: any[] = [];
+  const block = extractJSONObject(text, "tool_calls");
+  if (block) {
+    try {
+      const parsed = JSON.parse(block);
+      if (Array.isArray(parsed.tool_calls)) {
+        for (const tc of parsed.tool_calls) {
+          const name = tc.name || tc.function?.name || "";
+          const args = tc.arguments || tc.function?.arguments || tc.input || {};
+          if (name) calls.push(makeToolCall(name, args, calls.length));
+        }
+      }
+    } catch { /* ignore */ }
+  }
+  if (calls.length === 0) {
+    const single = extractJSONObject(text, "name");
+    if (single) {
+      try {
+        const parsed = JSON.parse(single);
+        if (parsed.name && typeof parsed.name === "string") {
+          const args = parsed.arguments || parsed.input || {};
+          calls.push(makeToolCall(parsed.name, args, 0));
+        }
+      } catch { /* ignore */ }
+    }
+  }
+  return calls;
+}
+
+function repairJSON(text: string): string {
+  let s = text.trim();
+  s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+  s = s.replace(/(['"])?([a-zA-Z_][a-zA-Z0-9_]*)(['"])?\s*:/g, '"$2":');
+  s = s.replace(/:\s*'([^']*)'/g, ':"$1"');
+  s = s.replace(/,\s*([\]}])/g, "$1");
+  const openBrace = (s.match(/{/g) || []).length - (s.match(/}/g) || []).length;
+  const openBracket = (s.match(/\[/g) || []).length - (s.match(/]/g) || []).length;
+  for (let i = 0; i < openBracket; i++) s += "]";
+  for (let i = 0; i < openBrace; i++) s += "}";
+  return s;
+}
+
+function dedupeToolCalls(calls: any[]): any[] {
+  const seen = new Set<string>();
+  return calls.filter((tc) => {
+    const key = tc.function.name + "\x00" + tc.function.arguments;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function parseToolCalls(content: string, tools?: any[]): { tool_calls: any[] | null; text: string } {
+  if (!content || !content.trim()) return { tool_calls: null, text: content };
+
+  // 1. ##TOOL_CALL## marker format (highest priority)
+  const { calls: markerCalls, cleaned } = extractMarkerToolCalls(content);
+
+  // 2. Strip code blocks from remaining text
+  const stripped = stripCodeBlocks(cleaned);
+
+  // 3. JSON tool_calls format
+  const jsonCalls = extractJSONToolCalls(stripped);
+
+  // 4. Single {"name":"...","arguments":{...}} format
+  let singleCalls: any[] = [];
+  if (markerCalls.length === 0 && jsonCalls.length === 0) {
+    singleCalls = extractJSONToolCalls(repairJSON(stripped));
+  }
+
+  const allCalls = [...markerCalls, ...jsonCalls, ...singleCalls];
+  if (allCalls.length === 0) return { tool_calls: null, text: content };
+
+  const deduped = dedupeToolCalls(allCalls);
+  if (deduped.length === 0) return { tool_calls: null, text: content };
+
+  // 工具名大小写修复 + 参数修复
+  const fixed = deduped.map((tc) => {
+    let fixedName = normalizeToolName(tc.function.name, tools || []);
+    let fixed = coerceToolArguments({ ...tc, function: { ...tc.function, name: fixedName } }, tools);
+    return fixed;
+  });
+
+  // Calculate remaining text
+  let text = content;
+  const markerRe = /##TOOL_CALL##\s*[\s\S]*?\s*##END_CALL##/g;
+  text = text.replace(markerRe, "").trim();
+  if (markerCalls.length === 0 && jsonCalls.length > 0) {
+    const block = extractJSONObject(content, "tool_calls");
+    if (block) text = text.replace(block, "").trim();
+  }
+  if (!text) text = "";
+
+  return { tool_calls: fixed, text };
 }
 
 function convertToolMessages(messages: any[]): any[] {
@@ -292,12 +498,13 @@ async function acquireToken(refreshToken: string): Promise<string> {
 }
 
 async function removeConversation(convId: string, refreshToken: string, assistantId = DEFAULT_ASSISTANT_ID) {
+  if (!getAutoDelete()) return;
   const token = await acquireToken(refreshToken);
   const sign = await generateSign();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000);
   try {
-    const response = await fetch("https://chatglm.cn/chatglm/backend-api/assistant/conversation/delete", {
+    const response = await fetch("https://chatglm.cn/chatglm/mainchat-api/conversation/bulk_delete", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -309,11 +516,14 @@ async function removeConversation(convId: string, refreshToken: string, assistan
         "X-Nonce": sign.nonce,
         ...getHeaders(),
       },
-      body: JSON.stringify({ assistant_id: assistantId, conversation_id: convId }),
+      body: JSON.stringify({ conversation_ids: [convId], assistant_id: assistantId }),
       signal: controller.signal,
     });
     await checkResult(response, refreshToken);
-  } catch {}
+    console.error(`[AutoDelete] 会话 ${convId} 已删除`);
+  } catch (err: any) {
+    console.error(`[AutoDelete] 删除会话 ${convId} 失败: ${err.message}`);
+  }
   finally { clearTimeout(timeoutId); }
 }
 
@@ -360,8 +570,9 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
     const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
-    let chatMode = '';
-    if (model.includes('think') || model.includes('zero')) { chatMode = 'zero'; }
+    let chatMode = 'thinking';
+    if (model.includes('fast')) { chatMode = ''; }
+    else if (model.includes('deep')) { chatMode = 'deep_thinking'; }
     if (model.includes('deepresearch')) { chatMode = 'deep_research'; }
     const token = await acquireToken(refreshToken);
     const sign = await generateSign();
@@ -427,8 +638,9 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
     const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
-    let chatMode = '';
-    if (model.includes('think') || model.includes('zero')) { chatMode = 'zero'; }
+    let chatMode = 'thinking';
+    if (model.includes('fast')) { chatMode = ''; }
+    else if (model.includes('deep')) { chatMode = 'deep_thinking'; }
     if (model.includes('deepresearch')) { chatMode = 'deep_research'; }
     const token = await acquireToken(refreshToken);
     const sign = await generateSign();
@@ -767,6 +979,7 @@ async function receiveStream(model: string, readableStream: ReadableStream, tool
     };
     const isSilentModel = model.includes('silent');
     const cachedParts: any[] = [];
+    let finished = false;
     const parser = createParser((event) => {
       try {
         const result = attempt(() => JSON.parse(event.data));
@@ -827,11 +1040,12 @@ async function receiveStream(model: string, readableStream: ReadableStream, tool
           data.choices[0].message.content = fullText;
           (data.choices[0].message as any).reasoning_content = fullReasoning || null;
         } else {
+          finished = true;
           let content = data.choices[0].message.content;
           content = content.replace(/【\d+†(来源|源|source)】/g, "");
           data.choices[0].message.content = content;
           if (tools && tools.length > 0) {
-            const parsed = parseToolCalls(content);
+            const parsed = parseToolCalls(content, tools);
             if (parsed.tool_calls) {
               (data.choices[0].message as any).tool_calls = parsed.tool_calls;
               (data.choices[0].message as any).content = parsed.text || "";
@@ -846,14 +1060,32 @@ async function receiveStream(model: string, readableStream: ReadableStream, tool
     });
     const reader = readableStream.getReader();
     const decoder = new TextDecoder();
+    let finishReceived = false;
+    const STREAM_CLOSE_WAIT = 3000; // 流关闭后等待 finish 事件的时间（毫秒）
+
     (async () => {
       try {
         while (true) {
           const { done, value } = await reader.read();
-          if (done) { resolve(data); break; }
+          if (done) {
+            if (!finishReceived) {
+              // 流关闭但未收到 finish，等待一段时间
+              console.error(`[receiveStream] 流已关闭，等待 finish 事件 (${STREAM_CLOSE_WAIT}ms)...`);
+              await new Promise(r => setTimeout(r, STREAM_CLOSE_WAIT));
+            }
+            if (finishReceived) {
+              resolve(data);
+            } else {
+              // 超时仍未收到 finish，返回错误
+              console.error(`[receiveStream] 等待超时，未收到 finish 事件，reject`);
+              reject(new Error("上游流异常结束，未收到完成事件"));
+            }
+            break;
+          }
           parser.feed(decoder.decode(value, { stream: true }));
         }
-      } catch (err) {
+      } catch (err: any) {
+        console.error(`[receiveStream] 流异常: ${err.message}`);
         reject(err);
       } finally {
         reader.releaseLock();
@@ -957,16 +1189,13 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
             if (chunk) {
               sentContent += chunk;
               fullContent += chunk;
-              // 智能缓冲：检测是否可能是纯工具调用 JSON，避免先发送部分 JSON 文本
               if (!isToolCallMode && tools && tools.length > 0) {
                 const trimmed = fullContent.trim();
                 if (!mightBeToolCall) {
-                  // 如果内容以 { 开头，可能是工具调用，进入缓冲模式
-                  if (trimmed.startsWith("{")) {
+                  if (trimmed.startsWith("##") || trimmed.startsWith("{")) {
                     mightBeToolCall = true;
                     pendingContent += chunk;
                   } else {
-                    // 不以 { 开头，直接发送
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                       id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
                       choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
@@ -974,23 +1203,29 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
                     })}\n\n`));
                   }
                 } else {
-                  // 已在缓冲模式，继续累积
                   pendingContent += chunk;
-                  // 当累积足够内容后，判断是否是工具调用
-                  if (trimmed.length >= 20) {
-                    if (trimmed.includes('"tool_calls"') || trimmed.includes("'tool_calls'") || trimmed.includes("tool_calls")) {
-                      isToolCallMode = true;
-                      pendingContent = "";
-                    } else {
-                      // 不是工具调用，一次性发送缓冲内容
-                      mightBeToolCall = false;
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                        id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
-                        choices: [{ index: 0, delta: { content: pendingContent }, finish_reason: null }],
-                        created,
-                      })}\n\n`));
-                      pendingContent = "";
-                    }
+                  if (pendingContent.includes("##END_CALL##")) {
+                    isToolCallMode = true;
+                    pendingContent = "";
+                  } else if (trimmed.includes('"tool_calls"') || (trimmed.startsWith("{") && trimmed.includes('"name"') && trimmed.length >= 15)) {
+                    isToolCallMode = true;
+                    pendingContent = "";
+                  } else if (!trimmed.startsWith("##") && !trimmed.startsWith("{")) {
+                    mightBeToolCall = false;
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
+                      choices: [{ index: 0, delta: { content: pendingContent }, finish_reason: null }],
+                      created,
+                    })}\n\n`));
+                    pendingContent = "";
+                  } else if (pendingContent.length > 100) {
+                    mightBeToolCall = false;
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
+                      choices: [{ index: 0, delta: { content: pendingContent }, finish_reason: null }],
+                      created,
+                    })}\n\n`));
+                    pendingContent = "";
                   }
                 }
               } else if (!isToolCallMode) {
@@ -1002,10 +1237,11 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
               }
             }
           } else {
+            streamFinishReceived = true;
             let finishReason = "stop";
             let delta: any = result.status == "intervene" && result.last_error?.intervene_text ? { content: `\n\n${result.last_error.intervene_text}` } : {};
             if (tools && tools.length > 0) {
-              const parsed = parseToolCalls(fullContent);
+              const parsed = parseToolCalls(fullContent, tools);
               if (parsed.tool_calls) {
                 finishReason = "tool_calls";
                 delta = { tool_calls: parsed.tool_calls };
@@ -1029,13 +1265,27 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
           controller.error(err);
         }
       });
+      let streamFinishReceived = false;
+      const closeTimeout = 5000;
       try {
         while (true) {
           const { done, value } = await reader.read();
-          if (done) { controller.close(); break; }
+          if (done) {
+            // 流关闭后等待 finish 事件
+            if (!streamFinishReceived) {
+              console.error(`[createTransStream] 流已关闭，等待 finish 事件 (${closeTimeout}ms)...`);
+              await new Promise(r => setTimeout(r, closeTimeout));
+            }
+            if (!streamFinishReceived) {
+              console.error(`[createTransStream] 等待超时，强制关闭流`);
+            }
+            controller.close();
+            break;
+          }
           parser.feed(decoder.decode(value, { stream: true }));
         }
       } catch (err) {
+        console.error(`[createTransStream] 流异常: ${err}`);
         controller.error(err);
       } finally {
         reader.releaseLock();

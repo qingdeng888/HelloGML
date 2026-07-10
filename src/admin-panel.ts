@@ -389,6 +389,18 @@ export function getAdminPanelHTML(): string {
     .stats-grid { grid-template-columns: 1fr; }
     .card { padding: 1.2rem; }
   }
+
+  /* Toggle Switch */
+  .toggle-wrap { display: flex; align-items: center; justify-content: space-between; padding: 1rem 0; }
+  .toggle-info { flex: 1; }
+  .toggle-info h4 { margin: 0 0 4px; font-size: 0.95rem; font-weight: 600; color: var(--ink); }
+  .toggle-info p { margin: 0; font-size: 0.82rem; color: var(--ink-faint); }
+  .toggle-switch { position: relative; width: 48px; height: 26px; flex-shrink: 0; margin-left: 1rem; }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider { position: absolute; cursor: pointer; inset: 0; background: var(--border); border-radius: 26px; transition: background 0.3s; }
+  .toggle-slider::before { content: ''; position: absolute; height: 20px; width: 20px; left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: transform 0.3s; box-shadow: 0 1px 3px rgba(0,0,0,0.15); }
+  .toggle-switch input:checked + .toggle-slider { background: var(--green); }
+  .toggle-switch input:checked + .toggle-slider::before { transform: translateX(22px); }
 </style>
 </head>
 <body>
@@ -423,6 +435,7 @@ export function getAdminPanelHTML(): string {
     <button class="nav-item" onclick="showSection('apikeys')">API Key</button>
     <button class="nav-item" onclick="showSection('tokens')">Token 池</button>
     <button class="nav-item" onclick="showSection('usage')">用量统计</button>
+    <button class="nav-item" onclick="showSection('settings')">设置</button>
     <button class="nav-item" onclick="showSection('guide')">使用指南</button>
   </div>
 
@@ -650,6 +663,23 @@ export function getAdminPanelHTML(): string {
     </div>
   </div>
 
+  <!-- Settings Section -->
+  <div class="section" id="section-settings">
+    <div class="card">
+      <div class="card-title">运行时设置</div>
+      <div class="toggle-wrap">
+        <div class="toggle-info">
+          <h4>自动删除会话</h4>
+          <p>开启后，每次 API 请求完成（含流式回复结束）后自动删除智谱清言端的会话，防止多用户串台。</p>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="toggleAutoDelete" onchange="toggleAutoDelete(this.checked)">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+  </div>
+
   <!-- Guide Section -->
   <div class="section" id="section-guide">
     <div class="card">
@@ -796,6 +826,7 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
     if (name === 'tokens') loadTokens();
     if (name === 'dashboard') loadDashboard();
     if (name === 'usage') loadUsage();
+    if (name === 'settings') loadSettings();
   };
   
   window.doLogin = async function() {
@@ -1169,6 +1200,27 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
       loadTokens();
     } catch (e) {
       showToast('重置失败: ' + e.message, 'error');
+    }
+  };
+
+  // ==================== Settings ====================
+
+  window.loadSettings = async function() {
+    try {
+      const data = await api('/admin/settings', { method: 'GET' });
+      $('toggleAutoDelete').checked = !!data.auto_delete;
+    } catch (e) {
+      showToast('加载设置失败: ' + e.message, 'error');
+    }
+  };
+
+  window.toggleAutoDelete = async function(enabled) {
+    try {
+      await api('/admin/settings', { method: 'POST', body: JSON.stringify({ auto_delete: enabled }) });
+      showToast('自动删除会话已' + (enabled ? '开启' : '关闭'), 'success');
+    } catch (e) {
+      showToast('设置失败: ' + e.message, 'error');
+      $('toggleAutoDelete').checked = !enabled;
     }
   };
 

@@ -1,4 +1,4 @@
-import { setSignSecret } from "./chat.ts";
+import { setSignSecret, setAutoDelete, getAutoDelete } from "./chat.ts";
 import {
   createCompletion,
   createCompletionStream,
@@ -22,11 +22,14 @@ import { getAdminPanelHTML } from "./admin-panel.ts";
 export interface Env {
   SIGN_SECRET?: string;
   ADMIN_KEY?: string;
+  AUTO_DELETE?: string;
   GLM_TOKENS: KVNamespace;
 }
 
 const SUPPORTED_MODELS = [
-  { id: "glm5", name: "GLM-5", object: "model", owned_by: "glm-free-api", description: "GLM-5 通用对话模型" },
+  { id: "glm-5.2-fast", name: "GLM-5.2 Fast", object: "model", owned_by: "glm-free-api", description: "GLM-5.2 快速模式，无思考" },
+  { id: "glm-5.2", name: "GLM-5.2", object: "model", owned_by: "glm-free-api", description: "GLM-5.2 标准思考模式" },
+  { id: "glm-5.2-deep", name: "GLM-5.2 Deep", object: "model", owned_by: "glm-free-api", description: "GLM-5.2 深度思考模式" },
 ];
 
 const GEMINI_MODELS = [
@@ -409,11 +412,33 @@ async function handleAdminTokenCheck(request: Request, env: Env): Promise<Respon
   return jsonResponse({ id, live });
 }
 
+async function handleAdminSettings(request: Request, env: Env): Promise<Response> {
+  const adminKey = request.headers.get("X-Admin-Key") || "";
+  if (env.ADMIN_KEY && adminKey !== env.ADMIN_KEY) {
+    return errorResponse("Unauthorized: invalid admin key", 401);
+  }
+
+  if (request.method === "GET") {
+    return jsonResponse({ auto_delete: getAutoDelete() });
+  }
+
+  if (request.method === "POST") {
+    const body = (await request.json()) as any;
+    if (typeof body.auto_delete === "boolean") {
+      setAutoDelete(body.auto_delete);
+    }
+    return jsonResponse({ success: true, auto_delete: getAutoDelete() });
+  }
+
+  return errorResponse("Method not allowed", 405);
+}
+
 // ==================== Main Export ====================
 
 export default {
   async fetch(request: Request, env: Env, _ctx: any): Promise<Response> {
     if (env.SIGN_SECRET) setSignSecret(env.SIGN_SECRET);
+    if (env.AUTO_DELETE) setAutoDelete(env.AUTO_DELETE !== "false");
 
     const url = new URL(request.url);
     let path = url.pathname;
@@ -463,6 +488,8 @@ export default {
         response = await handleAdminToken(request, env);
       } else if (path === "/admin/token/check" && request.method === "POST") {
         response = await handleAdminTokenCheck(request, env);
+      } else if (path === "/admin/settings") {
+        response = await handleAdminSettings(request, env);
       } else {
         const message = `[请求有误]: 正确请求为 POST -> /v1/chat/completions，当前请求为 ${request.method} -> ${path} 请纠正`;
         response = errorResponse(message, 404);

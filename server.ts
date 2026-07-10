@@ -36,6 +36,8 @@ import {
   generateVideos,
   getTokenLiveStatus,
   TokenExpiredError,
+  setAutoDelete,
+  getAutoDelete,
 } from "./src/chat.ts";
 import {
   createClaudeCompletion,
@@ -80,6 +82,7 @@ for (const f of [TOKEN_FILE, APIKEY_FILE]) {
 }
 
 setSignSecret(SIGN_SECRET);
+setAutoDelete(process.env.AUTO_DELETE !== "false");
 
 // ==================== Token 本地存储 & 智能轮询 ====================
 
@@ -540,7 +543,9 @@ function getCallerApiKey(req: http.IncomingMessage): string {
 // ==================== 路由处理 ====================
 
 const SUPPORTED_MODELS = [
-  { id: "glm5", name: "GLM-5", object: "model", owned_by: "glm-free-api", description: "GLM-5 通用对话模型" },
+  { id: "glm-5.2-fast", name: "GLM-5.2 Fast", object: "model", owned_by: "glm-free-api", description: "GLM-5.2 快速模式，无思考" },
+  { id: "glm-5.2", name: "GLM-5.2", object: "model", owned_by: "glm-free-api", description: "GLM-5.2 标准思考模式" },
+  { id: "glm-5.2-deep", name: "GLM-5.2 Deep", object: "model", owned_by: "glm-free-api", description: "GLM-5.2 深度思考模式" },
 ];
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -762,6 +767,25 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
       resetAllStats();
       jsonResponse(res, { success: true, message: "统计数据已重置" });
+      return;
+    }
+
+    // ===== 运行时设置（需要 Admin Key）=====
+    if (p === "/admin/settings") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      if (req.method === "GET") {
+        jsonResponse(res, { auto_delete: getAutoDelete() });
+        return;
+      }
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        if (typeof body.auto_delete === "boolean") {
+          setAutoDelete(body.auto_delete);
+        }
+        jsonResponse(res, { success: true, auto_delete: getAutoDelete() });
+        return;
+      }
+      errorResponse(res, "Method not allowed", 405);
       return;
     }
 
