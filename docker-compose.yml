@@ -5,19 +5,14 @@ services:
     restart: always
     ports:
       - "38412:38412"
-    environment:
-      - ADMIN_KEY=changeme
-      - DATA_DIR=/app/data
+    env_file:
+      - .env
     volumes:
-      # 目录挂载：避免单文件绑定挂载在宿主机上文件不存在时被 Docker 创建成目录
-      # entrypoint 脚本会在启动时自动 chown 该目录并降权到 node 用户运行
       - ./data:/app/data
-    # 资源限制：限制最大 128MB 内存，避免偶发泄漏影响宿主机
     deploy:
       resources:
         limits:
           memory: 128M
-    # 健康检查：自动探活
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:38412/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s

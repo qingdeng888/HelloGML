@@ -2,6 +2,7 @@ node_modules/
 tokens.json
 apikeys.json
 stats.json
+.env
 .wrangler/
 .dev.vars
 *.log
