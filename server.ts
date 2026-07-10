@@ -244,15 +244,14 @@ async function executeWithRotation<T>(fn: (token: string) => Promise<T>, ctx?: U
     if (tried.has(entry.id)) break;
     tried.add(entry.id);
 
-    try {
-      // 记录使用时间和频率
-      entry.lastUsed = Date.now();
-      if (!entry.requestTimestamps) entry.requestTimestamps = [];
-      entry.requestTimestamps.push(Date.now());
-      // 清理过期时间戳（只保留 1 分钟内的）
-      const windowStart = Date.now() - TOKEN_RATE_LIMIT_WINDOW;
-      entry.requestTimestamps = entry.requestTimestamps.filter(t => t > windowStart);
+    // 立即标记使用时间（在 await fn 之前），防止并发请求选中同一个 token
+    entry.lastUsed = Date.now();
+    if (!entry.requestTimestamps) entry.requestTimestamps = [];
+    entry.requestTimestamps.push(Date.now());
+    const windowStart = Date.now() - TOKEN_RATE_LIMIT_WINDOW;
+    entry.requestTimestamps = entry.requestTimestamps.filter(t => t > windowStart);
 
+    try {
       if (ctx) ctx.tokenId = entry.id;
       const result = await fn(entry.token);
 
