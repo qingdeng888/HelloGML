@@ -1,6 +1,9 @@
 services:
   glm-free-api:
-    image: ghcr.io/qingdeng888/hellogml:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hellogml:local
     container_name: glm-free-api
     restart: always
     ports:
