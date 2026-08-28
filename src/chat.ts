@@ -12,6 +12,9 @@ const ACCESS_TOKEN_EXPIRES = 3600;
 const MAX_RETRY_COUNT = 3;
 const RETRY_DELAY = 5000;
 const FILE_MAX_SIZE = 100 * 1024 * 1024;
+const MODEL_DISCOVERY_URL = "https://chatglm.cn/chatglm/agent-api/operation/detail?tag=available_models";
+const MODEL_DISCOVERY_TTL = 5 * 60 * 1000;
+let discoveredModels: { standard: string; flash: string; expiresAt: number } | null = null;
 
 let signSecret = "8a1317a7468aa3ad86e997d08f3f31cb";
 
@@ -30,6 +33,35 @@ export function setAutoDelete(v: boolean) {
 
 export function getAutoDelete(): boolean {
   return autoDelete;
+}
+
+// 官网模型名称会变更，定期读取 available_models，失败时使用最近一次/当前已知回退值。
+async function discoverModels(accessToken: string): Promise<{ standard: string; flash: string }> {
+  const now = Date.now();
+  if (discoveredModels && discoveredModels.expiresAt > now) return discoveredModels;
+  try {
+    const response = await fetch(MODEL_DISCOVERY_URL, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json", ...getHeaders() },
+    });
+    if (!response.ok) throw new Error(`model discovery HTTP ${response.status}`);
+    const body: any = await response.json();
+    const models = Array.isArray(body?.result?.models) ? body.result.models : [];
+    const ids = models.map((m: any) => String(m?.selected_model || "")).filter(Boolean);
+    const flash = ids.find((id: string) => /flash/i.test(id));
+    const standard = ids.find((id: string) => !/flash/i.test(id));
+    if (standard || flash) {
+      discoveredModels = {
+        standard: standard || discoveredModels?.standard || "glm-5.3",
+        flash: flash || discoveredModels?.flash || "glm-5.3-flash",
+        expiresAt: now + MODEL_DISCOVERY_TTL,
+      };
+      console.error(`[Models] discovered standard=${discoveredModels.standard}, flash=${discoveredModels.flash}`);
+      return discoveredModels;
+    }
+  } catch (err: any) {
+    console.error(`[Models] discovery failed: ${err.message}`);
+  }
+  return discoveredModels || { standard: "glm-5.3", flash: "glm-5.3-flash" };
 }
 
 const USER_AGENTS = [
@@ -570,11 +602,12 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
     const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
-    let chatMode = 'thinking';
-    if (model.includes('fast')) { chatMode = ''; }
-    else if (model.includes('deep')) { chatMode = 'deep_thinking'; }
+    let chatMode = '';
     if (model.includes('deepresearch')) { chatMode = 'deep_research'; }
+    else if (model.includes('deep')) { chatMode = 'deep_thinking'; }
+    else if (model.includes('thinking')) { chatMode = 'thinking'; }
     const token = await acquireToken(refreshToken);
+    const currentModels = await discoverModels(token);
     const sign = await generateSign();
     const response = await glmPostStream(
       "https://chatglm.cn/chatglm/backend-api/assistant/stream",
@@ -586,7 +619,9 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
         messages: messagesPrepare(processedMessages, refs, !!refConvId),
         meta_data: {
           channel: "",
-          chat_mode: chatMode || undefined,
+          // 官网快速模式会显式发送空字符串；省略该字段会触发上游默认 Flash
+          chat_mode: chatMode,
+          selected_model: model.includes('flash') ? currentModels.flash : currentModels.standard,
           draft_id: "",
           if_plus_model: true,
           input_question_type: "xxxx",
@@ -638,11 +673,12 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
     const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
-    let chatMode = 'thinking';
-    if (model.includes('fast')) { chatMode = ''; }
-    else if (model.includes('deep')) { chatMode = 'deep_thinking'; }
+    let chatMode = '';
     if (model.includes('deepresearch')) { chatMode = 'deep_research'; }
+    else if (model.includes('deep')) { chatMode = 'deep_thinking'; }
+    else if (model.includes('thinking')) { chatMode = 'thinking'; }
     const token = await acquireToken(refreshToken);
+    const currentModels = await discoverModels(token);
     const sign = await generateSign();
     const response = await glmPostStream(
       "https://chatglm.cn/chatglm/backend-api/assistant/stream",
@@ -654,7 +690,8 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
         messages: messagesPrepare(processedMessages, refs, !!refConvId),
         meta_data: {
           channel: "",
-          chat_mode: chatMode || undefined,
+          chat_mode: chatMode,
+          selected_model: model.includes('flash') ? currentModels.flash : currentModels.standard,
           draft_id: "",
           if_plus_model: true,
           input_question_type: "xxxx",

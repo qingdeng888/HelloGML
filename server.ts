@@ -542,9 +542,12 @@ function getCallerApiKey(req: http.IncomingMessage): string {
 // ==================== 路由处理 ====================
 
 const SUPPORTED_MODELS = [
-  { id: "glm-5.2-fast", name: "GLM-5.2 Fast", object: "model", owned_by: "glm-free-api", description: "GLM-5.2 快速模式，无思考" },
-  { id: "glm-5.2", name: "GLM-5.2", object: "model", owned_by: "glm-free-api", description: "GLM-5.2 标准思考模式" },
-  { id: "glm-5.2-deep", name: "GLM-5.2 Deep", object: "model", owned_by: "glm-free-api", description: "GLM-5.2 深度思考模式" },
+  { id: "glm-fast", name: "GLM 快速", object: "model", owned_by: "glm-free-api", description: "当前 GLM 快速模式" },
+  { id: "glm-thinking", name: "GLM 深度", object: "model", owned_by: "glm-free-api", description: "当前 GLM 深度模式" },
+  { id: "glm-deep", name: "GLM 极致", object: "model", owned_by: "glm-free-api", description: "当前 GLM 极致模式" },
+  { id: "glm-flash-fast", name: "GLM-Flash 快速", object: "model", owned_by: "glm-free-api", description: "当前 GLM-Flash 快速模式" },
+  { id: "glm-flash-thinking", name: "GLM-Flash 深度", object: "model", owned_by: "glm-free-api", description: "当前 GLM-Flash 深度模式" },
+  { id: "glm-flash-deep", name: "GLM-Flash 极致", object: "model", owned_by: "glm-free-api", description: "当前 GLM-Flash 极致模式" },
 ];
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
