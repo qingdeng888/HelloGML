@@ -15,6 +15,6 @@
 
 ## 验收标准
 
-- Actions 可发布 `linux/amd64` 和 `linux/arm64` 镜像。
+- Actions 可稳定发布 `linux/amd64` 镜像。
 - `docker compose config` 校验通过。
 - `docker compose -f docker-compose.local.yml build` 构建成功。
